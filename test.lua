@@ -78,6 +78,11 @@ local Config = {
 	PanelOpenCooldown = 8,          -- не чаще раза в N секунд
 	PanelButtons = { "pet needs", "pet care", "needs", "pets", "pet menu", "my pets", "потребности" },
 
+	-- Если над питомцем видна только иконка «пора покормить» без цифр,
+	-- считаем потребность низкой и всё равно действуем
+	UsePetGuiMarkers = true,
+	MarkerValue = 30,
+
 	-- Слова, по которым узнаётся кнопка/объект для потребности (подстроки).
 	-- ВАЖНО: именно эту таблицу правим, если игра называет действия иначе.
 	Actions = {
@@ -132,7 +137,7 @@ local Alive = true
 
 -- Встроенный журнал: всё видно в окне, даже если консоль (F9) недоступна
 local SESSION_START = os.clock()
-local Log = { lines = {}, max = 500, view = nil }
+local Log = { lines = {}, max = 1500, view = nil }
 
 local function joinArgs(...)
 	local parts = {}
@@ -1073,7 +1078,7 @@ end
 local BAR_HINTS = { "fill", "bar", "progress", "need", "value", "meter", "level", "indicator" }
 
 -- Пытается вытащить процент из найденного элемента интерфейса игры
-local function readValueFromGuiNode(node)
+local function readValueFromGuiNode(node, relaxed)
 	local layer = { node }
 	local depth = 0
 
@@ -1089,16 +1094,22 @@ local function readValueFromGuiNode(node)
 				end
 			end
 
-			-- полоска прогресса: нужен намёк в имени, иначе легко поймать контейнер
+			-- полоска прогресса
 			if item:IsA("GuiObject") then
 				local name = lower(item.Name)
 				local hinted = false
 				for _, hint in ipairs(BAR_HINTS) do
 					if name:find(hint, 1, true) then hinted = true break end
 				end
-				if hinted then
-					local ok, size = pcall(function() return item.Size.X.Scale end)
-					if ok and type(size) == "number" and size >= 0 and size <= 1 then
+
+				local ok, size = pcall(function() return item.Size.X.Scale end)
+				if ok and type(size) == "number" then
+					-- с намёком в имени доверяем любому значению 0..1
+					if hinted and size >= 0 and size <= 1 then
+						return size * 100
+					end
+					-- без намёка берём только явно неполную шкалу (контейнер обычно ровно 1)
+					if relaxed and item ~= node and size > 0 and size < 0.999 then
 						return size * 100
 					end
 				end
@@ -1140,7 +1151,7 @@ local function readNeedFromUI(need)
 					if value then return value end
 				end
 
-				if child:IsA("GuiObject") or child:IsA("Folder") then
+				if child:IsA("GuiObject") or child:IsA("Folder") or child:IsA("LayerCollector") then
 					table.insert(stack, child)
 				end
 			end
@@ -1148,6 +1159,72 @@ local function readNeedFromUI(need)
 	end
 
 	return nil
+end
+
+-- Все «таблички» питомца: и внутри модели, и привязанные через Adornee
+local function petBillboardHolders(pet)
+	local out = {}
+
+	for _, holder in ipairs(pet:GetDescendants()) do
+		if holder:IsA("BillboardGui") or holder:IsA("SurfaceGui") then
+			table.insert(out, holder)
+		end
+	end
+
+	local containers = { workspace }
+	local petsFolder = workspace:FindFirstChild("Pets")
+	if petsFolder then table.insert(containers, petsFolder) end
+
+	for _, container in ipairs(containers) do
+		for _, child in ipairs(container:GetChildren()) do
+			if child:IsA("BillboardGui") then
+				local adornee = child.Adornee
+				if adornee and (adornee == pet or adornee:IsDescendantOf(pet)) then
+					table.insert(out, child)
+				end
+			end
+		end
+	end
+
+	return out
+end
+
+-- Нужды, нарисованные над питомцем (полоски или иконки)
+local function readNeedFromPetGui(pet, need)
+	local keys = Config.NeedKeys[need] or { need }
+	local markerFound = false
+
+	for _, holder in ipairs(petBillboardHolders(pet)) do
+		for _, node in ipairs(holder:GetDescendants()) do
+			local name = lower(node.Name)
+			local match = false
+			for _, key in ipairs(keys) do
+				if name:find(lower(key), 1, true) then match = true break end
+			end
+
+			if match then
+				local value = readValueFromGuiNode(node, true)
+				if value then return value end
+
+				if node:IsA("GuiObject") and node.Visible then markerFound = true end
+			end
+		end
+	end
+
+	-- Цифр нет, но иконка «пора покормить» висит — считаем потребность низкой
+	if markerFound and Config.UsePetGuiMarkers then
+		return math.min(Config.MarkerValue, Config.Threshold - 1)
+	end
+
+	return nil
+end
+
+-- Единая цепочка: атрибуты/значения модели → GUI над питомцем → интерфейс игры
+local function readNeedAny(pet, need)
+	local value = readNeedFromPet(pet, need)
+	if value == nil then value = readNeedFromPetGui(pet, need) end
+	if value == nil then value = readNeedFromUI(need) end
+	return value
 end
 
 local petCache = { list = {}, at = 0 }
@@ -1209,6 +1286,24 @@ function Pets.find()
 			end
 		end
 	end
+
+	-- персонаж игрока питомцем быть не может
+	local clean = {}
+	for _, inst in ipairs(found) do
+		local parent = inst.Parent
+		local isCharacter = false
+
+		if Players:GetPlayerFromCharacter(inst) then isCharacter = true end
+		if parent and (parent.Name == "PlayerCharacters" or parent.Name == "Characters") then
+			isCharacter = true
+		end
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if inst.Name == plr.Name or inst.Name == plr.DisplayName then isCharacter = true end
+		end
+
+		if not isCharacter then table.insert(clean, inst) end
+	end
+	found = clean
 
 	-- отбрасываем чужих питомцев, если удалось отличить своих
 	local mine = {}
@@ -1288,6 +1383,7 @@ function Pets.pickTask()
 	for _, pet in ipairs(list) do
 		for _, need in ipairs(Config.Priority) do
 			local value = readNeedFromPet(pet, need)
+			if value == nil then value = readNeedFromPetGui(pet, need) end
 			if value == nil then value = uiValue(need) end
 			if value ~= nil then
 				readable = readable + 1
@@ -1524,6 +1620,119 @@ function World.dumpButtons(limit)
 	return list
 end
 
+-- Полный дамп окружения: интерфейс, кнопки, Active-элементы, питомцы, игрок
+function World.fullDump()
+	log("############ ПОЛНЫЙ ДАМП ############")
+
+	log("--- 1. PlayerGui: дерево (глубина 3) ---")
+	local function walk(node, depth)
+		if depth > 3 then return end
+		for _, child in ipairs(node:GetChildren()) do
+			if child:IsA("GuiObject") or child:IsA("LayerCollector") or child:IsA("Folder") then
+				local extra = ""
+				if child:IsA("ScreenGui") then
+					extra = string.format(" enabled=%s", tostring(child.Enabled))
+				elseif child:IsA("GuiObject") then
+					extra = string.format(" vis=%s size=%s", tostring(child.Visible), tostring(child.AbsoluteSize))
+				end
+				log(string.rep("  ", depth) .. child.Name .. " [" .. child.ClassName .. "]" .. extra)
+				walk(child, depth + 1)
+			end
+		end
+	end
+	for _, child in ipairs(PlayerGui:GetChildren()) do
+		if child ~= gui then
+			log("  " .. child.Name .. " [" .. child.ClassName .. "] enabled=" .. tostring(child.Enabled))
+			walk(child, 2)
+		end
+	end
+
+	log("--- 2. Все GuiButton (включая невидимые) ---")
+	local buttons = 0
+	for _, inst in ipairs(PlayerGui:GetDescendants()) do
+		if inst:IsA("GuiButton") and not inst:IsDescendantOf(gui) then
+			buttons = buttons + 1
+			if buttons <= 80 then
+				local text = ""
+				pcall(function() text = inst.Text end)
+				log(string.format("   %-30s vis=%s text=%q path=%s",
+					inst.Name, tostring(inst.Visible), tostring(text), inst:GetFullName()))
+			end
+		end
+	end
+	log("   всего GuiButton: " .. buttons)
+
+	log("--- 3. Active-элементы (ImageLabel / Frame с Active=true) ---")
+	local active = 0
+	for _, inst in ipairs(PlayerGui:GetDescendants()) do
+		if inst:IsA("GuiObject") and not inst:IsA("GuiButton")
+			and inst.Active and not inst:IsDescendantOf(gui) then
+			active = active + 1
+			if active <= 40 then
+				log("   " .. inst:GetFullName() .. " [" .. inst.ClassName .. "]")
+			end
+		end
+	end
+	log("   всего Active-элементов: " .. active)
+
+	log("--- 4. Питомцы и их содержимое ---")
+	for _, pet in ipairs(Pets.get(true)) do
+		log("   ПИТОМЕЦ: " .. pet:GetFullName() .. " [" .. pet.ClassName .. "]")
+		local n = 0
+		for _, inst in ipairs(pet:GetDescendants()) do
+			n = n + 1
+			if n <= 50 then
+				local val = ""
+				pcall(function()
+					if inst:IsA("ValueBase") then val = " = " .. tostring(inst.Value) end
+				end)
+				log(string.format("      %s [%s]%s", inst:GetFullName(), inst.ClassName, val))
+			end
+		end
+		log("      потомков: " .. n)
+
+		log("      -- таблички над питомцем --")
+		local holders = petBillboardHolders(pet)
+		if #holders == 0 then log("         (не найдены)") end
+		for _, holder in ipairs(holders) do
+			log("         HOLDER: " .. holder:GetFullName() .. " [" .. holder.ClassName
+				.. "] enabled=" .. tostring(holder.Enabled))
+			local k = 0
+			for _, node in ipairs(holder:GetDescendants()) do
+				k = k + 1
+				if k <= 40 then
+					local extra = ""
+					pcall(function()
+						if node:IsA("GuiObject") then
+							extra = string.format(" vis=%s scaleX=%.3f text=%q",
+								tostring(node.Visible), node.Size.X.Scale,
+								(node:IsA("TextLabel") and node.Text) or "")
+						end
+					end)
+					log("            " .. node.Name .. " [" .. node.ClassName .. "]" .. extra)
+				end
+			end
+			log("            элементов: " .. k)
+		end
+
+		for _, need in ipairs(Config.Priority) do
+			local v = readNeedAny(pet, need)
+			log(string.format("      %s = %s", need, v and string.format("%.0f", v) or "?"))
+		end
+	end
+
+	log("--- 5. Локальный игрок ---")
+	for _, inst in ipairs(LocalPlayer:GetChildren()) do
+		log("      " .. inst.Name .. " [" .. inst.ClassName .. "]")
+	end
+	local attrs = LocalPlayer:GetAttributes()
+	local buf = {}
+	for k, v in pairs(attrs) do table.insert(buf, k .. "=" .. tostring(v)) end
+	if #buf > 0 then log("   атрибуты игрока: " .. table.concat(buf, ", ")) end
+
+	log("############ КОНЕЦ ДАМПА ############")
+end
+
 -- Дамп мира для калибровки Config
 function World.debugScan()
 	log("=== ПИТОМЦЫ ===")
@@ -1534,8 +1743,7 @@ function World.debugScan()
 	for _, pet in ipairs(pets) do
 		local parts = { pet.Name, pet.ClassName }
 		for _, need in ipairs(Config.Priority) do
-			local v = readNeedFromPet(pet, need)
-			if v == nil then v = readNeedFromUI(need) end
+			local v = readNeedAny(pet, need)
 			table.insert(parts, string.format("%s=%s", need, v and string.format("%.0f", v) or "?"))
 		end
 		log(table.concat(parts, "  "))
@@ -1812,6 +2020,55 @@ function Capture.attachButtons()
 	end)
 end
 
+-- Захват любого клика по интерфейсу: работает и для картинок без текста
+function Capture.attachClicks()
+	if Capture.clicksAttached then return end
+	Capture.clicksAttached = true
+
+	UserInputService.InputBegan:Connect(function(input, processed)
+		if not Capture.active then return end
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1
+			and input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+		local pos = input.Position
+		local hits = {}
+		pcall(function() hits = PlayerGui:GetGuiObjectsAtPosition(pos.X, pos.Y) end)
+		if #hits == 0 then return end
+
+		local top = hits[1]
+		local desc = {}
+		for i, obj in ipairs(hits) do
+			if i > 5 then break end
+			table.insert(desc, string.format("%s[%s]", obj:GetFullName(), obj.ClassName))
+		end
+
+		local label = top.Name
+		pcall(function()
+			if top:IsA("TextLabel") or top:IsA("TextButton") or top:IsA("TextBox") then
+				if top.Text ~= "" then label = top.Text end
+			end
+		end)
+
+		Capture.record("CLICK", string.format("(%.0f,%.0f) %s", pos.X, pos.Y, tostring(label)),
+			table.concat(desc, " | "))
+
+		local need = needFromText(tostring(label) .. " " .. top:GetFullName())
+		if need then
+			Capture.pendingNeed = need
+			Capture.pendingAt = os.clock()
+
+			local already = false
+			for _, rec in ipairs(Capture.replays) do
+				if rec.element == top and rec.need == need then already = true break end
+			end
+			if not already then
+				table.insert(Capture.replays, { need = need, element = top, label = tostring(label), at = os.clock() })
+				log("захват: элемент записан для повтора →", need, top:GetFullName())
+			end
+		end
+	end)
+end
+
 function Capture.attachRemotes()
 	if Capture.hooked then return end
 	if not (hookmetamethod and getnamecallmethod and newcclosure) then
@@ -1853,8 +2110,12 @@ end
 function Capture.replaysFor(need)
 	local out = {}
 	for _, rec in ipairs(Capture.replays) do
-		if rec.need == need and rec.remote and rec.remote.Parent then
-			table.insert(out, rec)
+		if rec.need == need then
+			if rec.remote and rec.remote.Parent then
+				table.insert(out, rec)
+			elseif rec.element and rec.element.Parent then
+				table.insert(out, rec)
+			end
 		end
 	end
 	return out
@@ -1868,7 +2129,13 @@ function Capture.report()
 	end
 	table.insert(lines, string.format("записано remote-повторов: %d", #Capture.replays))
 	for _, rec in ipairs(Capture.replays) do
-		table.insert(lines, string.format("   %s → %s", rec.need, rec.remote:GetFullName()))
+		local what = "?"
+		if rec.remote and rec.remote.Parent then
+			what = rec.remote:GetFullName()
+		elseif rec.element and rec.element.Parent then
+			what = rec.element:GetFullName() .. " (клик по элементу)"
+		end
+		table.insert(lines, string.format("   %s → %s", rec.need, what))
 	end
 	table.insert(lines, "=============================================")
 	local text = table.concat(lines, "\n")
@@ -1882,6 +2149,7 @@ function Capture.start(seconds)
 	Capture.events = {}
 	Capture.replays = {}
 	Capture.attachButtons()
+	Capture.attachClicks()
 	Capture.attachRemotes()
 	UI.notify("Захват включён", "Покорми/напои питомца руками — запишу кнопку и remote", "warn")
 	Capture.record("START", "ручной режим", "длительность " .. tostring(seconds) .. " сек")
@@ -1966,6 +2234,12 @@ function Actions.clickGui(button, mode)
 	return false
 end
 
+-- Клик по любому элементу интерфейса (ImageLabel/Frame тоже)
+function Actions.clickElement(element)
+	if not element or not element.Parent then return false end
+	return Actions.clickGui(element, "virtual")
+end
+
 function Actions.fireRemote(remote, args)
 	if not remote or not remote.Parent then return false end
 	return pcall(function()
@@ -1988,6 +2262,8 @@ function Actions.use(entry)
 		return tryFireClick(entry.instance)
 	elseif entry.kind == "tool" then
 		return tryUseTool(entry.instance)
+	elseif entry.kind == "element" then
+		return Actions.clickElement(entry.instance)
 	elseif entry.kind == "remote" then
 		return Actions.fireRemote(entry.instance, entry.args)
 	end
@@ -2065,8 +2341,7 @@ local function diagnose()
 		if i > 5 then break end
 		local vals = {}
 		for _, need in ipairs(Config.Priority) do
-			local v = readNeedFromPet(pet, need)
-			if v == nil then v = readNeedFromUI(need) end
+			local v = readNeedAny(pet, need)
 			table.insert(vals, string.format("%s=%s", need, v and string.format("%.0f", v) or "?"))
 		end
 		log(string.format("   %s [%s]  %s", pet:GetFullName(), pet.ClassName, table.concat(vals, "  ")))
@@ -2098,6 +2373,9 @@ local function describeEntry(entry)
 	if entry.kind == "prompt" then return "ProximityPrompt " .. entry.instance.Name end
 	if entry.kind == "click" then return "ClickDetector " .. entry.instance.Name end
 	if entry.kind == "tool" then return "Tool " .. entry.instance.Name end
+	if entry.kind == "element" then
+		return string.format("клик по элементу «%s»", tostring(entry.label or entry.instance.Name))
+	end
 	if entry.kind == "remote" then return "remote " .. entry.instance:GetFullName() end
 	return tostring(entry.kind)
 end
@@ -2125,7 +2403,11 @@ local function buildPlan(need)
 	end
 
 	for _, rec in ipairs(Capture.replaysFor(need)) do
-		table.insert(plan, { kind = "remote", instance = rec.remote, args = rec.args })
+		if rec.element then
+			table.insert(plan, { kind = "element", instance = rec.element, label = rec.label })
+		elseif rec.remote then
+			table.insert(plan, { kind = "remote", instance = rec.remote, args = rec.args })
+		end
 	end
 
 	while #plan > 8 do table.remove(plan) end
@@ -2338,6 +2620,10 @@ UI.slider("Критический порог (%)", 0, 80, Config.CriticalThresho
 	Config.CriticalThreshold = v
 end)
 
+UI.toggle("Иконка над питомцем = нужда", Config.UsePetGuiMarkers, function(v)
+	Config.UsePetGuiMarkers = v
+end)
+
 UI.slider("Интервал сканирования (сек × 0.25)", 1, 12, Config.ScanInterval / 0.25, 1, function(v)
 	Config.ScanInterval = v * 0.25
 end)
@@ -2374,6 +2660,12 @@ end)
 UI.button("Диагностика: 1 цикл", function()
 	diagnose()
 end, true)
+
+UI.button("Полный дамп (UI + питомцы)", function()
+	World.fullDump()
+	UI.showLog(true)
+	UI.notify("Дамп готов", Log.export(), "success")
+end)
 
 UI.button("Открыть журнал (отчёты и лог)", function()
 	UI.showLog(true)
