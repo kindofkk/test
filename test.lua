@@ -130,9 +130,65 @@ end
 
 local Alive = true
 
+-- Встроенный журнал: всё видно в окне, даже если консоль (F9) недоступна
+local SESSION_START = os.clock()
+local Log = { lines = {}, max = 500, view = nil }
+
+local function joinArgs(...)
+	local parts = {}
+	for i = 1, select("#", ...) do
+		local v = select(i, ...)
+		local ok, s = pcall(tostring, v)
+		parts[i] = ok and s or "?"
+	end
+	return table.concat(parts, " ")
+end
+
+function Log.add(text)
+	local stamp = string.format("[%6.1f] ", os.clock() - SESSION_START)
+	table.insert(Log.lines, stamp .. text)
+	while #Log.lines > Log.max do table.remove(Log.lines, 1) end
+
+	if Log.view then
+		pcall(function()
+			Log.view.Text = table.concat(Log.lines, "\n")
+			local holder = Log.view.Parent
+			if holder and holder:IsA("ScrollingFrame") then
+				holder.CanvasPosition = Vector2.new(0, math.max(0, holder.AbsoluteCanvasSize.Y))
+			end
+		end)
+	end
+end
+
+function Log.text()
+	return table.concat(Log.lines, "\n")
+end
+
+-- Отдаёт отчёт наружу: буфер обмена, файл, либо вкладка "Журнал"
+function Log.export()
+	local text = Log.text()
+	local where = {}
+
+	if setclipboard then
+		if pcall(setclipboard, text) then table.insert(where, "скопирован в буфер обмена") end
+	end
+	if writefile then
+		if pcall(writefile, "PetAutopilot_report.txt", text) then
+			table.insert(where, "файл PetAutopilot_report.txt")
+		end
+	end
+
+	if #where == 0 then
+		return "Смотри вкладку «Журнал»: нажми «Выделить» и Ctrl+C"
+	end
+	return "Отчёт: " .. table.concat(where, " · ")
+end
+
 local function log(...)
+	local text = joinArgs(...)
+	Log.add(text)
 	if Config.Debug then
-		print("[PetAutopilot]", ...)
+		pcall(print, "[PetAutopilot] " .. text)
 	end
 end
 
@@ -430,6 +486,21 @@ local closeBtn = create("TextButton", {
 	Parent = header,
 }, { corner(6) })
 
+-- Кнопка переключения на вкладку «Журнал»
+local logBtn = create("TextButton", {
+	Name = "LogToggle",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -72, 0, 16),
+	Size = UDim2.new(0, 22, 0, 22),
+	BackgroundColor3 = Theme.SurfaceAlt,
+	AutoButtonColor = false,
+	Text = "≡",
+	Font = FONT_BOLD,
+	TextSize = 15,
+	TextColor3 = Theme.Accent,
+	Parent = header,
+}, { corner(6) })
+
 -- Панель управления
 local toggleBar = create("Frame", {
 	Name = "ToggleBar",
@@ -485,6 +556,170 @@ local footer = create("Frame", {
 		BorderSizePixel = 0,
 	}),
 })
+
+-- Вкладка «Журнал»: показывает всё, что скрипт делает
+local logView = create("ScrollingFrame", {
+	Name = "LogView",
+	Position = UDim2.new(0, 0, 0, 96),
+	Size = UDim2.new(1, 0, 1, -184),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 3,
+	ScrollBarImageColor3 = Theme.Stroke,
+	CanvasSize = UDim2.new(0, 0, 0, 0),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	Visible = false,
+	Parent = window,
+}, {
+	create("UIPadding", {
+		PaddingTop = UDim.new(0, 4),
+		PaddingBottom = UDim.new(0, 6),
+		PaddingLeft = UDim.new(0, 14),
+		PaddingRight = UDim.new(0, 14),
+	}),
+	create("TextLabel", {
+		Name = "Text",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Code,
+		Text = Log.text(),
+		TextColor3 = Theme.Muted,
+		TextSize = 10,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+	}),
+})
+
+Log.view = logView:FindFirstChild("Text")
+
+-- Кнопки работы с отчётом
+local logActions = create("Frame", {
+	Name = "LogActions",
+	Position = UDim2.new(0, 0, 0, 382),
+	Size = UDim2.new(1, 0, 0, 44),
+	BackgroundTransparency = 1,
+	Visible = false,
+	Parent = window,
+}, {
+	create("UIPadding", {
+		PaddingTop = UDim.new(0, 4),
+		PaddingBottom = UDim.new(0, 8),
+		PaddingLeft = UDim.new(0, 14),
+		PaddingRight = UDim.new(0, 14),
+	}),
+	create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}),
+})
+
+-- Поле с текстом отчёта: можно выделить и скопировать вручную (Ctrl+A, Ctrl+C)
+local reportBox = create("TextBox", {
+	Name = "ReportBox",
+	Position = UDim2.new(0, 0, 0, 96),
+	Size = UDim2.new(1, 0, 1, -184),
+	BackgroundColor3 = Theme.Surface,
+	BorderSizePixel = 0,
+	Font = Enum.Font.Code,
+	Text = "",
+	TextColor3 = Theme.Text,
+	TextSize = 10,
+	TextWrapped = true,
+	TextEditable = false,
+	ClearTextOnFocus = false,
+	MultiLine = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	Visible = false,
+	ZIndex = 5,
+	Parent = window,
+}, {
+	corner(8),
+	stroke(Theme.Stroke, 1, 0.3),
+	create("UIPadding", {
+		PaddingTop = UDim.new(0, 8),
+		PaddingBottom = UDim.new(0, 8),
+		PaddingLeft = UDim.new(0, 8),
+		PaddingRight = UDim.new(0, 8),
+	}),
+})
+
+local function logActionButton(label, callback)
+	local btn = create("TextButton", {
+		Size = UDim2.new(0.25, -5, 1, 0),
+		BackgroundColor3 = Theme.SurfaceAlt,
+		AutoButtonColor = false,
+		Font = FONT_BOLD,
+		Text = label,
+		TextColor3 = Theme.Text,
+		TextSize = 11,
+		Parent = logActions,
+	}, { corner(7), stroke(Theme.Stroke, 1, 0.5) })
+
+	btn.MouseButton1Click:Connect(function()
+		local ok, err = pcall(callback)
+		if not ok then UI.notify("Ошибка", tostring(err), "error") end
+	end)
+	return btn
+end
+
+logActionButton("Копир.", function()
+	if not setclipboard then
+		UI.notify("Нет доступа", "Исполнитель не даёт setclipboard — жми «Выделить»", "warn")
+		return
+	end
+	pcall(setclipboard, Log.text())
+	UI.notify("Скопировано", "Отчёт в буфере обмена", "success")
+end)
+
+logActionButton("Файл", function()
+	if not writefile then
+		UI.notify("Нет доступа", "Исполнитель не даёт writefile — жми «Выделить»", "warn")
+		return
+	end
+	local ok = pcall(writefile, "PetAutopilot_report.txt", Log.text())
+	if ok then
+		UI.notify("Сохранено", "PetAutopilot_report.txt (папка исполнителя)", "success")
+	else
+		UI.notify("Не вышло", "Запись файла отклонена", "error")
+	end
+end)
+
+logActionButton("Выделить", function()
+	reportBox.Text = Log.text()
+	reportBox.Visible = true
+	UI.notify("Текст открыт", "Ctrl+A, затем Ctrl+C — и пришли мне отчёт", "success")
+end)
+
+logActionButton("Очистить", function()
+	Log.lines = {}
+	if Log.view then Log.view.Text = "" end
+	reportBox.Visible = false
+	UI.notify("Журнал очищен", "Записи удалены", "success")
+end)
+
+local logPage = false
+
+function UI.showLog(show)
+	logPage = (show == nil) and true or show
+
+	content.Visible = not logPage
+	logView.Visible = logPage
+	logActions.Visible = logPage
+	reportBox.Visible = false
+
+	if logPage and Log.view then
+		Log.view.Text = Log.text()
+		logView.CanvasPosition = Vector2.new(0, math.max(0, logView.AbsoluteCanvasSize.Y))
+	end
+end
+
+function UI.isLogShown()
+	return logPage
+end
 
 local statusLabel = create("TextLabel", {
 	Name = "Status",
@@ -1849,7 +2084,8 @@ local function diagnose()
 	log("кнопка панели питомца:", #World.findPanelButton() > 0 and "есть" or "не найдена")
 	log("=========== КОНЕЦ ДИАГНОСТИКИ =========")
 
-	UI.notify("Диагностика готова", "Отчёт в консоли (F9). Пришли его мне — подстрою Config", "success")
+	UI.showLog(true)
+	UI.notify("Диагностика готова", Log.export(), "success")
 end
 
 local function describeEntry(entry)
@@ -2139,6 +2375,10 @@ UI.button("Диагностика: 1 цикл", function()
 	diagnose()
 end, true)
 
+UI.button("Открыть журнал (отчёты и лог)", function()
+	UI.showLog(true)
+end)
+
 UI.section("Прочее")
 
 UI.toggle("Anti-AFK", Config.AntiAfk, function(v) Config.AntiAfk = v end)
@@ -2160,10 +2400,17 @@ minBtn.MouseButton1Click:Connect(function()
 	minimized = not minimized
 	local target = minimized and UDim2.new(0, 360, 0, 52) or UDim2.new(0, 360, 0, 470)
 	tween(window, 0.24, { Size = target })
-	content.Visible = not minimized
+	content.Visible = (not minimized) and not logPage
 	footer.Visible = not minimized
 	toggleBar.Visible = not minimized
+	logView.Visible = (not minimized) and logPage
+	logActions.Visible = (not minimized) and logPage
+	if minimized then reportBox.Visible = false end
 	minBtn.Text = minimized and "+" or "—"
+end)
+
+logBtn.MouseButton1Click:Connect(function()
+	UI.showLog(not logPage)
 end)
 
 local hidden = false
@@ -2204,6 +2451,9 @@ print([[
   End         — выгрузить скрипт
 Питомец не найден? Нажми "Debug: скан мира" и посмотри консоль (F9).
 ]])
+
+Log.add("Скрипт запущен. RightShift — окно, RightCtrl — вкл/выкл, End — выгрузить.")
+Log.add("Кнопка ≡ в шапке или «Открыть журнал» — лог и отчёты (консоль не нужна).")
 
 if Config.AutoStart then
 	UI.notify("Автопилот активен", "Питомец обслуживается без твоего участия", "success")
